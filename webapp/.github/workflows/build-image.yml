@@ -1,0 +1,215 @@
+name: Build Custom Image
+
+on:
+ push:
+   branches: [ main ]
+
+jobs:
+ build-image:
+   name: "Build and Deploy Custom Image"
+   runs-on: ubuntu-latest
+   steps:
+   - name: "Checkout Code"   
+     uses: actions/checkout@v3
+
+   - name: "Setup Node.js Environment"
+     uses: actions/setup-node@v3
+     with:
+       node-version: '20.x'
+       cache: 'npm' #Testing
+
+   - name: "Install and Configure PostgreSQL"
+     run: |
+       sudo apt-get update
+       sudo apt-get install -y postgresql postgresql-contrib
+       sudo service postgresql start
+       sudo systemctl enable postgresql
+
+       # Creates DB
+       sudo -u postgres psql -c "CREATE DATABASE health_check_test;"
+
+       # Creates user
+       sudo -u postgres psql -c "CREATE USER ${{ secrets.POSTGRES_USER }} WITH PASSWORD '${{ secrets.POSTGRES_PASSWORD }}';"
+
+       # Grants access
+       sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE health_check_test TO ${{ secrets.POSTGRES_USER }};"
+       sudo -u postgres psql -d health_check_test -c "GRANT ALL ON SCHEMA public TO ${{ secrets.POSTGRES_USER }};"
+
+       # Verify database
+       echo "Checking if database exists:"
+       sudo -u postgres psql -c "\l" | grep health_check_test
+
+   - name: "Install Node Dependencies"
+     run: npm ci
+
+   - name: Prepare Logging Directory
+     run: |
+       mkdir -p ${{ github.workspace }}/logs
+       chmod 755 ${{ github.workspace }}/logs
+
+   - name: "Run Integration Tests"
+     env:
+       DATABASE_URL: postgres://${{ secrets.POSTGRES_USER }}:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/health_check_test
+       NODE_ENV: test
+       LOG_DIR: ${{ github.workspace }}/logs
+     run: npm test
+
+   - name: "Create Application Archive"
+     run: |
+       # Create .env file
+       cat > .env << EOL
+       DATABASE_URL=postgres://${{ secrets.DB_USERNAME_PACKER }}:${{ secrets.DB_PASSWORD_PACKER }}@localhost:5432/${{ secrets.POSTGRES_NAME }}
+       PORT=8080
+       EOL
+
+       zip -r webapp.zip .
+       mv webapp.zip packer/
+       ls -lah packer/
+
+   - name: "Setup AWS CLI"
+     run: |
+       curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+       unzip awscliv2.zip
+       sudo ./aws/install --update
+       aws --version
+
+   - name: "Configure AWS Credentials for DEV account"
+     uses: aws-actions/configure-aws-credentials@v1
+     with:
+       aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PACKER_DEV }}
+       aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PACKER_DEV }}
+       aws-region: ${{ secrets.AWS_REGION }}
+
+   - name: "Configure Google Cloud SDK"
+     uses: 'google-github-actions/auth@v2'
+     with:
+       credentials_json: '${{ secrets.GCP_SA_KEY_PACKER_DEV }}'
+       export_default_credentials: true
+
+   - name: "Setup HashiCorp Packer"
+     uses: hashicorp/setup-packer@main
+     with:
+       version: '1.9.4'
+
+   - name: "Initialize Packer"
+     run: packer init packer/ami.pkr.hcl
+
+   - name: "Build Custom Images with Packer"
+     env:
+       DB_PASSWORD: ${{ secrets.DB_PASSWORD_PACKER }}
+       DB_USER: ${{ secrets.DB_USERNAME_PACKER }}
+       DB_NAME: ${{ secrets.POSTGRES_NAME }}
+       GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID_DEV }}
+       GCP_DEMO_PROJECT_ID: ${{ secrets.GCP_DEMO_PROJECT_ID }}
+       AWS_DEMO_ID: ${{ secrets.AWS_DEMO_ID }}
+     run: |
+      # Store Packer output in a file for parsing
+      packer build \
+        -var "db_password=$DB_PASSWORD" \
+        -var "db_user=$DB_USER" \
+        -var "db_name=$DB_NAME" \
+        -var "gcp_project_id=$GCP_PROJECT_ID" \
+        -var "gcp_demo_project_id=$GCP_DEMO_PROJECT_ID" \
+        -var "demo_aws_account_id=$AWS_DEMO_ID" \
+        packer/ami.pkr.hcl | tee packer_output.log
+      
+      # Extract the latest AMI ID from the Packer output
+      AMI_ID=$(grep -o 'ami-[a-z0-9]*' packer_output.log | tail -1)
+      echo "Found AMI ID in Packer output: $AMI_ID"
+      
+      # Verify this is a valid AMI ID
+      aws ec2 describe-images --image-ids $AMI_ID --region ${{ secrets.AWS_REGION }}
+      
+      echo "Using AMI ID: $AMI_ID"
+      echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+
+   # [NEW] Configure AWS CLI for DEMO account
+   - name: "Configure AWS Credentials for DEMO account"
+     uses: aws-actions/configure-aws-credentials@v1
+     with:
+       aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PACKER_DEMO }}
+       aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PACKER_DEMO }}
+       aws-region: ${{ secrets.AWS_REGION }}
+
+   # [NEW] Create new Launch Template version
+   - name: "Create New Launch Template Version"
+     run: |
+       # Get existing Launch Template by name
+       LAUNCH_TEMPLATE_NAME="csye6225_launch_template"
+       
+       # Create new version with the latest AMI
+       NEW_VERSION=$(aws ec2 create-launch-template-version \
+         --launch-template-name $LAUNCH_TEMPLATE_NAME \
+         --version-description "Auto-updated by GitHub Actions on $(date)" \
+         --source-version '$Latest' \
+         --launch-template-data "{\"ImageId\":\"$AMI_ID\"}" \
+         --query 'LaunchTemplateVersion.VersionNumber' \
+         --output text)
+       
+       echo "Created new Launch Template version: $NEW_VERSION"
+       echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+
+   - name: "Check for Existing Instance Refreshes"
+     run: |
+      ASG_NAME="csye6225_asg"
+      
+      # Check if there's an in-progress refresh
+      REFRESH_STATUS=$(aws autoscaling describe-instance-refreshes \
+        --auto-scaling-group-name $ASG_NAME \
+        --query "InstanceRefreshes[?Status=='InProgress'].InstanceRefreshId" \
+        --output text)
+      
+      if [ -n "$REFRESH_STATUS" ]; then
+        echo "Found in-progress instance refresh: $REFRESH_STATUS"
+        
+        # Cancel the existing refresh
+        aws autoscaling cancel-instance-refresh --auto-scaling-group-name $ASG_NAME
+        echo "Cancelled existing instance refresh"
+        sleep 30  # Give AWS some time to process the cancellation
+      else
+        echo "No in-progress instance refreshes found"
+      fi
+
+   # [NEW] Start instance refresh for Auto Scaling Group
+   - name: "Start Instance Refresh"
+     run: |
+       ASG_NAME="csye6225_asg"
+       
+       # Start instance refresh
+       REFRESH_ID=$(aws autoscaling start-instance-refresh \
+         --auto-scaling-group-name $ASG_NAME \
+         --preferences "{\"MinHealthyPercentage\": 90, \"InstanceWarmup\": 300}" \
+         --query 'InstanceRefreshId' \
+         --output text)
+       
+       echo "Started instance refresh with ID: $REFRESH_ID"
+       echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_ENV
+
+   # [NEW] Wait for instance refresh to complete
+   - name: "Wait for Instance Refresh to Complete"
+     run: |
+       ASG_NAME="csye6225_asg"
+       REFRESH_ID=${{ env.REFRESH_ID }}
+       
+       echo "Waiting for instance refresh to complete..."
+       
+       while true; do
+         REFRESH_STATUS=$(aws autoscaling describe-instance-refreshes \
+           --auto-scaling-group-name $ASG_NAME \
+           --instance-refresh-ids $REFRESH_ID \
+           --query 'InstanceRefreshes[0].Status' \
+           --output text)
+         
+         echo "Current status: $REFRESH_STATUS"
+         
+         if [ "$REFRESH_STATUS" == "Successful" ]; then
+           echo "Instance refresh completed successfully!"
+           break
+         elif [ "$REFRESH_STATUS" == "Failed" ] || [ "$REFRESH_STATUS" == "Cancelled" ]; then
+           echo "Instance refresh failed or was cancelled."
+           exit 1
+         fi
+         
+         echo "Waiting for 30 seconds before checking again..."
+         sleep 30
+       done

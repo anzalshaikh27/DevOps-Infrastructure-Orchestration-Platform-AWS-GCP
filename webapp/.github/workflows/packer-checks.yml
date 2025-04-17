@@ -1,0 +1,41 @@
+name: Packer Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  packer-checks:
+    name: "Packer Checks"
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: "Checkout"
+      uses: actions/checkout@v3
+
+    - name: "Setup Packer"
+      uses: hashicorp/setup-packer@main
+      with:
+        version: '1.9.4'
+
+    - name: Zip webapp-fork
+      run: |
+      
+          zip -r webapp.zip .
+          mv webapp.zip packer/
+          ls -lah packer/
+
+    - name: "Packer Init"
+      run: packer init packer/ami.pkr.hcl
+
+    - name: "Check Packer Formatting"
+      run: |
+        packer fmt -check -recursive packer/ami.pkr.hcl
+        if [ $? -ne 0 ]; then
+          echo "Packer template is not properly formatted. Run 'packer fmt' locally and commit changes."
+          exit 1
+        fi
+      continue-on-error: false
+
+    - name: Validate Packer Template
+      run: packer validate packer/ami.pkr.hcl

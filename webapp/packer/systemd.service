@@ -1,0 +1,21 @@
+[Unit]
+Description=CSYE 6225 App
+After=network.target postgresql.service google-startup-scripts.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=csye6225
+Group=csye6225
+WorkingDirectory=/opt/app/webapp
+ExecStart=/usr/bin/node /opt/app/webapp/app.js
+Restart=always
+RestartSec=3
+StandardOutput=file:/var/log/webapp/application.log
+StandardError=file:/var/log/webapp/error.log
+SyslogIdentifier=csye6225
+EnvironmentFile=/opt/app/webapp/.env
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=multi-user.target
